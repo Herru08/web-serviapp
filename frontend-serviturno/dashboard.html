@@ -218,6 +218,34 @@
         <tbody id="tabla-usuarios"></tbody>
       </table>
     </div>
+
+    <section id="roleEditor" class="card p-5 mt-6 hidden" aria-labelledby="rolesTitle">
+      <h2 id="rolesTitle" class="font-extrabold text-lg">Gestión de roles y permisos</h2>
+      <p class="small muted mt-1 mb-4">Selecciona los permisos que tendrán los usuarios asignados a cada rol.</p>
+      <div class="grid gap-3 md:grid-cols-2">
+        <div>
+          <label class="label" for="roleSelector">Rol existente</label>
+          <select id="roleSelector" class="input"></select>
+        </div>
+        <div>
+          <label class="label" for="roleName">Nombre</label>
+          <input id="roleName" class="input" maxlength="80" required>
+        </div>
+        <div class="md:col-span-2">
+          <label class="label" for="roleDescription">Descripción</label>
+          <textarea id="roleDescription" class="input" rows="2" maxlength="255"></textarea>
+        </div>
+      </div>
+      <fieldset class="mt-4">
+        <legend class="label">Permisos</legend>
+        <div id="rolePermissionList" class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3"></div>
+      </fieldset>
+      <div class="flex flex-wrap gap-2 mt-5">
+        <button id="btnNewRole" type="button" class="btn btn-ok">＋ Nuevo rol</button>
+        <button id="btnSaveRole" type="button" class="btn btn-primary" style="width:auto">Guardar rol y permisos</button>
+        <button id="btnDeleteRole" type="button" class="btn btn-danger">Eliminar rol</button>
+      </div>
+    </section>
   </section>
 
   <!-- Directorio + alta -->

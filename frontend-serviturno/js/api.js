@@ -10,7 +10,7 @@ async function fetchAPI(endpoint, options = {}) {
         const response = await fetch(`${API_URL}${endpoint}`, config);
         
         // Redirect to Login if unauthorized (and not already on login or landing)
-        if (response.status === 401 || response.status === 403) {
+        if (response.status === 401) {
             if (!window.location.pathname.includes('login.html') && !window.location.pathname.endsWith('/') && !window.location.pathname.includes('index.html')) {
                 window.location.href = 'login.html';
             }

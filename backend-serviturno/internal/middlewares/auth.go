@@ -2,12 +2,15 @@ package middlewares
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
-	"serviturno-backend/pkg/security"
 	"strings"
+
+	"serviturno-backend/pkg/security"
 )
 
 type contextKey string
@@ -27,7 +30,15 @@ func RoleFromRequest(r *http.Request) (string, bool) {
 	return role, ok && role != ""
 }
 
-func RequireRole(requiredRole string, next http.Handler) http.Handler {
+func RequireAuthenticated(db *sql.DB, next http.Handler) http.Handler {
+	return requireAccess(db, "", next)
+}
+
+func RequirePermission(db *sql.DB, permission string, next http.Handler) http.Handler {
+	return requireAccess(db, permission, next)
+}
+
+func requireAccess(db *sql.DB, permission string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("jwt")
 		if err != nil {
@@ -41,22 +52,49 @@ func RequireRole(requiredRole string, next http.Handler) http.Handler {
 			return
 		}
 
-		userRole, ok := claims["rol"].(string)
-		if !ok || userRole == "" {
+		userIDClaim, ok := claims["user_id"].(float64)
+		if !ok || userIDClaim < 1 || userIDClaim > float64(^uint(0)>>1) || userIDClaim != float64(int(userIDClaim)) {
 			writeJSONError(w, http.StatusUnauthorized, "Sesión inválida")
 			return
 		}
-		if requiredRole != "" && userRole != requiredRole && userRole != "Administrador" {
-			writeJSONError(w, http.StatusForbidden, "Acceso denegado")
+		userID := int(userIDClaim)
+		var userRole string
+		err = db.QueryRow(`SELECT COALESCE(r.nombre, 'Usuario Regular')
+			FROM usuarios u
+			LEFT JOIN usuario_rol ur ON ur.usuario_id = u.id
+			LEFT JOIN roles r ON r.id = ur.rol_id
+			WHERE u.id = ? AND u.activo = 1
+			LIMIT 1`, userID).Scan(&userRole)
+		if err == sql.ErrNoRows {
+			writeJSONError(w, http.StatusUnauthorized, "Cuenta no encontrada o inactiva")
 			return
+		}
+		if err != nil {
+			log.Printf("auth: validar cuenta: %v", err)
+			writeJSONError(w, http.StatusInternalServerError, "Error interno")
+			return
+		}
+		if permission != "" {
+			var allowed bool
+			err = db.QueryRow(`SELECT EXISTS (
+				SELECT 1
+				FROM usuario_rol ur
+				JOIN rol_permiso rp ON rp.rol_id = ur.rol_id
+				JOIN permisos p ON p.id = rp.permiso_id
+				WHERE ur.usuario_id = ? AND p.codigo = ?
+			)`, userID, permission).Scan(&allowed)
+			if err != nil {
+				log.Printf("auth: validar permiso %q: %v", permission, err)
+				writeJSONError(w, http.StatusInternalServerError, "Error interno")
+				return
+			}
+			if !allowed {
+				writeJSONError(w, http.StatusForbidden, "Acceso denegado")
+				return
+			}
 		}
 
-		userIDClaim, ok := claims["user_id"].(float64)
-		if !ok || userIDClaim < 1 || userIDClaim > float64(^uint(0)>>1) {
-			writeJSONError(w, http.StatusUnauthorized, "Sesión inválida")
-			return
-		}
-		ctx := context.WithValue(r.Context(), userIDContextKey, int(userIDClaim))
+		ctx := context.WithValue(r.Context(), userIDContextKey, userID)
 		ctx = context.WithValue(ctx, roleContextKey, userRole)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

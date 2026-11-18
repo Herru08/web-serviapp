@@ -22,19 +22,27 @@ func TestChangePasswordRequiresCurrentPasswordAndSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE usuarios (id INTEGER PRIMARY KEY, password_hash TEXT NOT NULL, activo INTEGER NOT NULL)`); err != nil {
+	if _, err := db.Exec(`
+		CREATE TABLE usuarios (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL, correo TEXT NOT NULL, password_hash TEXT NOT NULL, activo INTEGER NOT NULL);
+		CREATE TABLE roles (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL);
+		CREATE TABLE usuario_rol (usuario_id INTEGER NOT NULL, rol_id INTEGER NOT NULL);
+		INSERT INTO roles (id, nombre) VALUES (1, 'Usuario Regular');
+	`); err != nil {
 		t.Fatal(err)
 	}
 	oldHash, err := security.HashPassword("correct-old-password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO usuarios (id, password_hash, activo) VALUES (1, ?, 1)`, oldHash); err != nil {
+	if _, err := db.Exec(`INSERT INTO usuarios (id, nombre, correo, password_hash, activo) VALUES (1, 'Test', 'test@example.com', ?, 1)`, oldHash); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO usuario_rol (usuario_id, rol_id) VALUES (1, 1)`); err != nil {
 		t.Fatal(err)
 	}
 
 	authHandler := handlers.NewAuthHandler(db)
-	handler := middlewares.RequireRole("", http.HandlerFunc(authHandler.ChangePassword))
+	handler := middlewares.RequireAuthenticated(db, http.HandlerFunc(authHandler.ChangePassword))
 	token, err := security.GenerateJWT(1, "Usuario Regular")
 	if err != nil {
 		t.Fatal(err)
@@ -72,5 +80,49 @@ func TestChangePasswordRequiresCurrentPasswordAndSession(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("request without session status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestRegisterAssignsDefaultRole(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`
+		CREATE TABLE usuarios (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			nombre TEXT NOT NULL,
+			correo TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			activo INTEGER NOT NULL,
+			creado_en TEXT NOT NULL
+		);
+		CREATE TABLE roles (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL);
+		CREATE TABLE usuario_rol (usuario_id INTEGER NOT NULL, rol_id INTEGER NOT NULL);
+		INSERT INTO roles (id, nombre) VALUES (1, 'Usuario Regular');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := handlers.NewAuthHandler(db)
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/register",
+		strings.NewReader(`{"nombre":"New User","correo":"new@example.com","password":"password-123"}`))
+	response := httptest.NewRecorder()
+	handler.Register(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("register status = %d, want %d: %s", response.Code, http.StatusOK, response.Body.String())
+	}
+
+	var role string
+	if err := db.QueryRow(`SELECT r.nombre
+		FROM usuario_rol ur JOIN roles r ON r.id = ur.rol_id
+		JOIN usuarios u ON u.id = ur.usuario_id
+		WHERE u.correo = ?`, "new@example.com").Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	if role != "Usuario Regular" {
+		t.Fatalf("registered user role = %q, want %q", role, "Usuario Regular")
 	}
 }

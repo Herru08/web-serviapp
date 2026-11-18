@@ -2,6 +2,9 @@
 
 let rolesCache = [];
 let directorioCache = [];
+let currentPermissions = new Set();
+let permissionsCatalog = [];
+let allowedSections = new Set();
 
 const MAPA_CENTRO = [16.7533, -93.1165];
 const TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
@@ -13,6 +16,14 @@ const SECCIONES = {
     directorio: ['Directorio y registro', 'Da de alta negocios y consulta los publicados'],
     mapa:       ['Mapa de negocios', 'Ubicación de todos los negocios aprobados'],
     auditoria:  ['Auditoría', 'Últimos 50 movimientos registrados en el sistema']
+};
+const PERMISO_SECCION = {
+    dashboard: 'dashboard.leer',
+    negocios: 'negocios.gestionar',
+    directorio: 'negocios.leer',
+    mapa: 'negocios.leer',
+    usuarios: 'usuarios.leer',
+    auditoria: 'auditoria.leer'
 };
 const PALETA = ['#2560AC', '#d97706', '#7c3aed', '#db2777', '#2563eb', '#65a30d', '#dc2626', '#0891b2'];
 
@@ -57,12 +68,28 @@ function showAlert(msg, error = false) {
 document.addEventListener('DOMContentLoaded', async () => {
     try {
         const me = await api('/auth/me');
+        currentPermissions = new Set(asArray(me.permisos));
         const nombre = me && (me.nombre || me.correo);
         if ($('adminNombre') && nombre) $('adminNombre').textContent = nombre;
     } catch (e) {
         window.location.href = 'login.html';
         return;
     }
+
+    document.querySelectorAll('[data-nav]').forEach(button => {
+        const section = button.dataset.nav;
+        const allowed = currentPermissions.has(PERMISO_SECCION[section]);
+        button.classList.toggle('hidden', !allowed);
+        if (allowed) allowedSections.add(section);
+    });
+    const canReadBusinesses = currentPermissions.has('negocios.leer');
+    const canManageBusinesses = currentPermissions.has('negocios.gestionar');
+    $('btnDashboardNegocio').classList.toggle('hidden', !(canReadBusinesses && canManageBusinesses));
+    const canReadRoles = currentPermissions.has('roles.leer');
+    $('btnNuevoUsuario').classList.toggle('hidden', !(currentPermissions.has('usuarios.crear') && canReadRoles));
+    if (!currentPermissions.has('usuarios.crear') || !canReadRoles) $('formCrearUsuario').classList.add('hidden');
+    $('formCrearNegocio').classList.toggle('hidden', !(canReadBusinesses && canManageBusinesses));
+    $('roleEditor').classList.toggle('hidden', !(currentPermissions.has('roles.gestionar') && canReadRoles));
 
     $('btnLogout').addEventListener('click', async () => {
         try { await api('/auth/logout', { method: 'POST' }); } catch (e) { /* se sale igual */ }
@@ -95,14 +122,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     ['nLatitud', 'nLongitud'].forEach(id => $(id).addEventListener('change', moverMarcadorDesdeInputs));
     $('formCrearNegocio').addEventListener('submit', crearNegocio);
     $('formCrearUsuario').addEventListener('submit', crearUsuario);
+    $('roleSelector').addEventListener('change', cargarRolSeleccionado);
+    $('btnNewRole').addEventListener('click', prepararNuevoRol);
+    $('btnSaveRole').addEventListener('click', guardarRol);
+    $('btnDeleteRole').addEventListener('click', eliminarRol);
     $('btnNuevoUsuario').addEventListener('click', () => {
         const f = $('formCrearUsuario');
         f.classList.toggle('hidden');
         if (!f.classList.contains('hidden')) $('uNombre').focus();
     });
 
-    showSection('dashboard');
-    actualizarContadorPendientes();
+    const firstSection = ['dashboard', 'negocios', 'directorio', 'mapa', 'usuarios', 'auditoria']
+        .find(section => allowedSections.has(section));
+    if (firstSection) {
+        showSection(firstSection);
+        if (currentPermissions.has('negocios.gestionar')) actualizarContadorPendientes();
+    } else {
+        $('sectionTitle').textContent = 'Sin permisos asignados';
+        $('sectionSubtitle').textContent = 'Contacta al administrador para solicitar acceso.';
+        Object.keys(SECCIONES).forEach(section => $(`sec-${section}`).classList.add('hidden'));
+    }
 });
 
 async function crearNegocio(e) {
@@ -145,7 +184,7 @@ async function crearNegocio(e) {
 
 // ---------- navegación ----------
 function showSection(id) {
-    if (!SECCIONES[id]) return;
+    if (!SECCIONES[id] || !allowedSections.has(id)) return;
     Object.keys(SECCIONES).forEach(s => $(`sec-${s}`).classList.toggle('hidden', s !== id));
     document.querySelectorAll('[data-nav]').forEach(b => b.classList.toggle('active', b.dataset.nav === id));
     $('sectionTitle').textContent = SECCIONES[id][0];
@@ -168,9 +207,9 @@ async function cargarDashboard() {
     try {
         const [stats, negocios, pendientes, auditoria] = await Promise.all([
             api('/admin/stats'),
-            api('/admin/negocios'),
-            api('/admin/negocios/pendientes'),
-            api('/admin/auditoria')
+            currentPermissions.has('negocios.leer') ? api('/admin/negocios') : Promise.resolve([]),
+            currentPermissions.has('negocios.gestionar') ? api('/admin/negocios/pendientes') : Promise.resolve([]),
+            currentPermissions.has('auditoria.leer') ? api('/admin/auditoria') : Promise.resolve([])
         ]);
         const listaNegocios = asArray(negocios);
         const listaPendientes = asArray(pendientes);
@@ -183,11 +222,11 @@ async function cargarDashboard() {
         const formato = new Intl.NumberFormat('es-MX');
 
         $('statUsuarios').textContent = formato.format(Number(stats.usuarios) || 0);
-        $('statNegocios').textContent = formato.format(listaNegocios.length);
-        $('statPendientes').textContent = formato.format(listaPendientes.length);
+        $('statNegocios').textContent = currentPermissions.has('negocios.leer') ? formato.format(listaNegocios.length) : '—';
+        $('statPendientes').textContent = currentPermissions.has('negocios.gestionar') ? formato.format(listaPendientes.length) : '—';
         $('statCategorias').textContent = formato.format(categorias.size);
 
-        if (categoriesEl) {
+        if (categoriesEl && currentPermissions.has('negocios.leer')) {
             if (!categoriasOrdenadas.length) {
                 categoriesEl.innerHTML = '<p class="small muted">Aún no hay negocios aprobados.</p>';
             } else {
@@ -198,15 +237,19 @@ async function cargarDashboard() {
                         <div class="category-track"><span class="category-fill" style="--c:${colorCategoria(nombre === 'Sin categoría' ? '' : nombre)};width:${Math.max(4, cantidad / max * 100)}%"></span></div>
                     </div>`).join('');
             }
+        } else if (categoriesEl) {
+            categoriesEl.innerHTML = '<p class="small muted">No tienes permiso para consultar negocios.</p>';
         }
 
-        if (activityEl) {
+        if (activityEl && currentPermissions.has('auditoria.leer')) {
             const eventos = asArray(auditoria).slice(0, 5);
             activityEl.innerHTML = eventos.length ? eventos.map(evento => `
                 <div class="border-b pb-3 last:border-0" style="border-color:var(--line)">
                     <div class="text-sm font-semibold">${esc(evento.accion || 'Movimiento registrado')}</div>
                     <div class="small muted mt-1">${esc(evento.correo || 'Usuario eliminado')} · ${esc(evento.fecha || '')}</div>
                 </div>`).join('') : '<p class="small muted">Aún no hay movimientos registrados.</p>';
+        } else if (activityEl) {
+            activityEl.innerHTML = '<p class="small muted">No tienes permiso para consultar auditoría.</p>';
         }
     } catch (error) {
         if (categoriesEl) categoriesEl.innerHTML = `<p class="small text-error">${esc(msgError(error))}</p>`;
@@ -240,21 +283,28 @@ async function cargarUsuarios() {
     const tb = $('tabla-usuarios');
     tb.innerHTML = filaMensaje(4, 'Cargando…');
     try {
-        if (rolesCache.length === 0) rolesCache = asArray(await api('/admin/roles'));
-        pintarSelectRoles();
+        const canManageUsers = currentPermissions.has('usuarios.gestionar');
+        const canManageRoles = currentPermissions.has('roles.gestionar');
+        const canReadRoles = currentPermissions.has('roles.leer');
+        if (canReadRoles && rolesCache.length === 0) rolesCache = asArray(await api('/admin/roles'));
+        if (currentPermissions.has('usuarios.crear') && canReadRoles) pintarSelectRoles();
+        if (currentPermissions.has('roles.gestionar') && canReadRoles) await cargarEditorRoles();
         const data = asArray(await api('/admin/usuarios'));
         tb.innerHTML = data.length ? data.map(u => {
             const opts = rolesCache.map(r => `<option value="${esc(r.id)}" ${u.rol === r.nombre ? 'selected' : ''}>${esc(r.nombre)}</option>`).join('');
             const badge = u.activo ? '<span class="badge badge-ok">Activo</span>' : '<span class="badge badge-bad">Suspendido</span>';
+            const rol = canManageRoles && canReadRoles
+                ? `<select data-rol-usuario="${esc(u.id)}" class="input input-sm">${opts}</select>`
+                : esc(u.rol);
+            const actions = canManageUsers ? `
+                <button data-action="ban" data-id="${esc(u.id)}" data-activo="${u.activo ? 'true' : 'false'}" class="btn btn-warn">${u.activo ? 'Suspender' : 'Reactivar'}</button>
+                <button data-action="borrar" data-id="${esc(u.id)}" class="btn btn-danger">Borrar</button>` : '—';
             return `
             <tr>
                 <td class="td"><div class="strong">${esc(u.nombre)}</div><div class="muted small">${esc(u.correo)}</div></td>
                 <td class="td">${badge}</td>
-                <td class="td"><select data-rol-usuario="${esc(u.id)}" class="input input-sm">${opts}</select></td>
-                <td class="td nowrap">
-                    <button data-action="ban" data-id="${esc(u.id)}" data-activo="${u.activo ? 'true' : 'false'}" class="btn btn-warn">${u.activo ? 'Suspender' : 'Reactivar'}</button>
-                    <button data-action="borrar" data-id="${esc(u.id)}" class="btn btn-danger">Borrar</button>
-                </td>
+                <td class="td">${rol}</td>
+                <td class="td nowrap">${actions}</td>
             </tr>`;
         }).join('') : filaMensaje(4, 'No hay usuarios registrados');
     } catch (e) {
@@ -266,10 +316,120 @@ function pintarSelectRoles() {
     const sel = $('uRol');
     if (!sel) return;
     const actual = sel.value;
-    sel.innerHTML = rolesCache.map(r => `<option value="${esc(r.id)}">${esc(r.nombre)}</option>`).join('');
+    const availableRoles = currentPermissions.has('roles.gestionar')
+        ? rolesCache
+        : rolesCache.filter(role => asArray(role.permisos).length === 0);
+    sel.innerHTML = availableRoles.map(r => `<option value="${esc(r.id)}">${esc(r.nombre)}</option>`).join('');
     // Por defecto, el rol más básico si existe
-    const basico = rolesCache.find(r => r.nombre === 'Usuario Regular');
-    sel.value = actual || (basico ? String(basico.id) : '');
+    const basico = availableRoles.find(r => r.nombre === 'Usuario Regular');
+    sel.value = availableRoles.some(role => String(role.id) === actual)
+        ? actual
+        : (basico ? String(basico.id) : '');
+}
+
+async function cargarEditorRoles(preferredRoleID = '') {
+    const [roles, permisos] = await Promise.all([
+        api('/admin/roles'),
+        api('/admin/roles/permisos')
+    ]);
+    rolesCache = asArray(roles);
+    permissionsCatalog = asArray(permisos);
+    const selector = $('roleSelector');
+    const selected = preferredRoleID || selector.value;
+    selector.innerHTML = rolesCache.map(role =>
+        `<option value="${esc(role.id)}">${esc(role.nombre)}</option>`).join('');
+    if (rolesCache.some(role => String(role.id) === selected)) selector.value = selected;
+    else selector.value = rolesCache.length ? String(rolesCache[0].id) : '';
+    if (selector.value) cargarRolSeleccionado();
+    else prepararNuevoRol();
+}
+
+function cargarRolSeleccionado() {
+    const role = rolesCache.find(item => String(item.id) === $('roleSelector').value);
+    if (!role) {
+        prepararNuevoRol();
+        return;
+    }
+    const isSystemRole = role.nombre === 'Administrador' || role.nombre === 'Usuario Regular';
+    $('roleName').value = role.nombre;
+    $('roleName').disabled = isSystemRole;
+    $('roleDescription').value = role.descripcion || '';
+    pintarCasillasPermisos(role.permisos, role.nombre === 'Administrador');
+    $('btnDeleteRole').disabled = isSystemRole;
+}
+
+function pintarCasillasPermisos(selectedCodes, disabled) {
+    const selected = new Set(asArray(selectedCodes));
+    $('rolePermissionList').innerHTML = permissionsCatalog.map(permission => `
+        <label class="flex items-start gap-2 rounded-lg border p-3 small" style="border-color:var(--line)">
+          <input type="checkbox" data-role-permission="${esc(permission.codigo)}" ${selected.has(permission.codigo) ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
+          <span><strong>${esc(permission.nombre)}</strong><br><span class="muted">${esc(permission.descripcion)}</span></span>
+        </label>`).join('');
+}
+
+function prepararNuevoRol() {
+    $('roleSelector').value = '';
+    $('roleName').value = '';
+    $('roleName').disabled = false;
+    $('roleDescription').value = '';
+    $('btnDeleteRole').disabled = true;
+    pintarCasillasPermisos([], false);
+    $('roleName').focus();
+}
+
+async function guardarRol() {
+    const name = $('roleName').value.trim();
+    if (!name) {
+        showAlert('Escribe el nombre del rol.', true);
+        return;
+    }
+    const roleID = parseInt($('roleSelector').value, 10) || 0;
+    const body = {
+        nombre: name,
+        descripcion: $('roleDescription').value.trim(),
+        permisos: [...document.querySelectorAll('[data-role-permission]:checked')]
+            .map(input => input.dataset.rolePermission)
+    };
+    const button = $('btnSaveRole');
+    button.disabled = true;
+    try {
+        let selectedRoleID = String(roleID);
+        if (roleID) {
+            body.id = roleID;
+            await api('/admin/roles/actualizar', { method: 'PUT', body: JSON.stringify(body) });
+            showAlert('Rol y permisos actualizados');
+        } else {
+            const result = await api('/admin/roles/crear', { method: 'POST', body: JSON.stringify(body) });
+            if (!result || !result.id) throw new Error('El servidor no confirmó que el rol se guardó.');
+            selectedRoleID = String(result.id);
+            showAlert('Rol creado');
+        }
+        await cargarEditorRoles(selectedRoleID);
+        await cargarUsuarios();
+    } catch (error) {
+        showAlert(msgError(error), true);
+    } finally {
+        button.disabled = false;
+    }
+}
+
+async function eliminarRol() {
+    const roleID = parseInt($('roleSelector').value, 10) || 0;
+    const role = rolesCache.find(item => item.id === roleID);
+    if (!role || role.nombre === 'Administrador' || role.nombre === 'Usuario Regular') return;
+    if (!confirm(`¿Eliminar el rol "${role.nombre}"? No se puede eliminar si todavía está asignado a usuarios.`)) return;
+    try {
+        await api('/admin/roles/eliminar', {
+            method: 'DELETE',
+            body: JSON.stringify({ rol_id: roleID })
+        });
+        showAlert('Rol eliminado');
+        rolesCache = [];
+        await cargarEditorRoles();
+        await cargarUsuarios();
+    } catch (error) {
+        showAlert(msgError(error), true);
+    }
 }
 
 async function crearUsuario(e) {

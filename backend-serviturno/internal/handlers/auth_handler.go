@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
+	"time"
+
 	"serviturno-backend/internal/middlewares"
 	"serviturno-backend/pkg/security"
-	"time"
 )
 
 type AuthHandler struct{ DB *sql.DB }
@@ -77,12 +79,63 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, `{"error": "Método no permitido"}`, http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct{ Nombre, Correo, Password string }
-	json.NewDecoder(r.Body).Decode(&req)
-	hash, _ := security.HashPassword(req.Password)
-	_, err := h.DB.Exec(`INSERT INTO usuarios (nombre, correo, password_hash, activo, creado_en) VALUES (?, ?, ?, 1, ?)`, req.Nombre, req.Correo, hash, time.Now().Format("2006-01-02 15:04:05"))
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Datos inválidos"}`, http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Nombre) == "" || strings.TrimSpace(req.Correo) == "" || len(req.Password) < 8 || len(req.Password) > 72 {
+		http.Error(w, `{"error": "Nombre, correo y contraseña válida son obligatorios"}`, http.StatusBadRequest)
+		return
+	}
+	hash, err := security.HashPassword(req.Password)
 	if err != nil {
-		http.Error(w, `{"error": "El correo ya está registrado"}`, http.StatusBadRequest)
+		log.Printf("auth: Register hash: %v", err)
+		http.Error(w, `{"error": "No se pudo crear la cuenta"}`, http.StatusInternalServerError)
+		return
+	}
+	tx, err := h.DB.Begin()
+	if err != nil {
+		log.Printf("auth: Register begin: %v", err)
+		http.Error(w, `{"error": "No se pudo crear la cuenta"}`, http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT INTO usuarios (nombre, correo, password_hash, activo, creado_en) VALUES (?, ?, ?, 1, ?)`, strings.TrimSpace(req.Nombre), strings.TrimSpace(req.Correo), hash, time.Now().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			http.Error(w, `{"error": "El correo ya está registrado"}`, http.StatusConflict)
+			return
+		}
+		log.Printf("auth: Register insert: %v", err)
+		http.Error(w, `{"error": "No se pudo crear la cuenta"}`, http.StatusInternalServerError)
+		return
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		log.Printf("auth: Register id: %v", err)
+		http.Error(w, `{"error": "No se pudo crear la cuenta"}`, http.StatusInternalServerError)
+		return
+	}
+	roleResult, err := tx.Exec(`INSERT INTO usuario_rol (usuario_id, rol_id)
+		SELECT ?, id FROM roles WHERE nombre = 'Usuario Regular'`, id)
+	if err != nil {
+		log.Printf("auth: Register role: %v", err)
+		http.Error(w, `{"error": "No se pudo asignar el rol inicial"}`, http.StatusInternalServerError)
+		return
+	}
+	if affected, _ := roleResult.RowsAffected(); affected == 0 {
+		http.Error(w, `{"error": "No existe el rol inicial de usuario"}`, http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("auth: Register commit: %v", err)
+		http.Error(w, `{"error": "No se pudo crear la cuenta"}`, http.StatusInternalServerError)
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]string{"mensaje": "Registro exitoso"})
@@ -140,8 +193,54 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, `{"error": "Método no permitido"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	userID, ok := middlewares.UserIDFromRequest(r)
+	if !ok {
+		http.Error(w, `{"error": "No autorizado"}`, http.StatusUnauthorized)
+		return
+	}
 	rol, _ := middlewares.RoleFromRequest(r)
-	json.NewEncoder(w).Encode(map[string]string{"rol": rol})
+	var nombre, correo string
+	if err := h.DB.QueryRow(`SELECT nombre, correo FROM usuarios WHERE id = ?`, userID).Scan(&nombre, &correo); err != nil {
+		log.Printf("auth: Me usuario: %v", err)
+		http.Error(w, `{"error": "Error interno"}`, http.StatusInternalServerError)
+		return
+	}
+	rows, err := h.DB.Query(`SELECT DISTINCT p.codigo
+		FROM usuario_rol ur
+		JOIN rol_permiso rp ON rp.rol_id = ur.rol_id
+		JOIN permisos p ON p.id = rp.permiso_id
+		WHERE ur.usuario_id = ?
+		ORDER BY p.codigo`, userID)
+	if err != nil {
+		log.Printf("auth: Me permisos: %v", err)
+		http.Error(w, `{"error": "Error interno"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	permisos := make([]string, 0)
+	for rows.Next() {
+		var permiso string
+		if err := rows.Scan(&permiso); err != nil {
+			log.Printf("auth: Me permisos scan: %v", err)
+			http.Error(w, `{"error": "Error interno"}`, http.StatusInternalServerError)
+			return
+		}
+		permisos = append(permisos, permiso)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("auth: Me permisos rows: %v", err)
+		http.Error(w, `{"error": "Error interno"}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"rol": rol, "nombre": nombre, "correo": correo, "permisos": permisos,
+	})
 }
 
 func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {

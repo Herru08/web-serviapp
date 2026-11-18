@@ -1,9 +1,13 @@
 package middlewares
 
 import (
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	_ "modernc.org/sqlite"
+	"serviturno-backend/pkg/security"
 )
 
 func TestParseAllowedOriginsRequiresExplicitOrigins(t *testing.T) {
@@ -27,6 +31,7 @@ func TestCORSRestrictsOriginsAndUnsafeRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	called := false
 	handler := EnableCORS(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		called = true
@@ -66,5 +71,71 @@ func TestCORSRestrictsOriginsAndUnsafeRequests(t *testing.T) {
 				t.Fatal("untrusted origin received Access-Control-Allow-Origin")
 			}
 		})
+	}
+}
+
+func TestRequirePermissionUsesCurrentDatabasePermissions(t *testing.T) {
+	if err := security.ConfigureJWTSecret("permission-test-signing-key-with-32-bytes"); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	_, err = db.Exec(`
+		CREATE TABLE usuarios (id INTEGER PRIMARY KEY, activo INTEGER NOT NULL);
+		CREATE TABLE roles (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL);
+		CREATE TABLE usuario_rol (usuario_id INTEGER NOT NULL, rol_id INTEGER NOT NULL);
+		CREATE TABLE permisos (id INTEGER PRIMARY KEY, codigo TEXT NOT NULL);
+		CREATE TABLE rol_permiso (rol_id INTEGER NOT NULL, permiso_id INTEGER NOT NULL);
+		INSERT INTO usuarios VALUES (1, 1);
+		INSERT INTO roles VALUES (1, 'Administrador');
+		INSERT INTO usuario_rol VALUES (1, 1);
+		INSERT INTO permisos VALUES (1, 'usuarios.leer');
+		INSERT INTO rol_permiso VALUES (1, 1);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := security.GenerateJWT(1, "Administrador")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	requestFor := func(handler http.Handler) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodGet, "/api/admin/usuarios", nil)
+		request.AddCookie(&http.Cookie{Name: "jwt", Value: token})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	allowed := requestFor(RequirePermission(db, "usuarios.leer", next))
+	if allowed.Code != http.StatusNoContent {
+		t.Fatalf("granted permission status = %d, want %d", allowed.Code, http.StatusNoContent)
+	}
+	denied := requestFor(RequirePermission(db, "roles.gestionar", next))
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("missing permission status = %d, want %d", denied.Code, http.StatusForbidden)
+	}
+
+	if _, err := db.Exec(`DELETE FROM rol_permiso WHERE rol_id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	revoked := requestFor(RequirePermission(db, "usuarios.leer", next))
+	if revoked.Code != http.StatusForbidden {
+		t.Fatalf("revoked permission status = %d, want %d", revoked.Code, http.StatusForbidden)
+	}
+
+	if _, err := db.Exec(`UPDATE usuarios SET activo = 0 WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	inactive := requestFor(RequirePermission(db, "usuarios.leer", next))
+	if inactive.Code != http.StatusUnauthorized {
+		t.Fatalf("inactive user status = %d, want %d", inactive.Code, http.StatusUnauthorized)
 	}
 }

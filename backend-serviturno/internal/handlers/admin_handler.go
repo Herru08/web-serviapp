@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
+	"serviturno-backend/internal/middlewares"
 )
 
 type AdminHandler struct{ DB *sql.DB }
@@ -79,28 +81,320 @@ func (h *AdminHandler) GetAuditoria(w http.ResponseWriter, r *http.Request) {
 // ---------- roles y usuarios ----------
 
 func (h *AdminHandler) GetRoles(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.DB.Query(`SELECT id, nombre FROM roles ORDER BY id`)
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		adminError(w, http.StatusMethodNotAllowed, "Método no permitido")
+		return
+	}
+	rows, err := h.DB.Query(`SELECT r.id, r.nombre, COALESCE(r.descripcion, ''), p.codigo
+		FROM roles r
+		LEFT JOIN rol_permiso rp ON rp.rol_id = r.id
+		LEFT JOIN permisos p ON p.id = rp.permiso_id
+		ORDER BY r.id, p.codigo`)
 	if err != nil {
 		adminDBError(w, "GetRoles", err)
 		return
 	}
 	defer rows.Close()
 
-	roles := make([]map[string]interface{}, 0)
+	type role struct {
+		ID          int      `json:"id"`
+		Nombre      string   `json:"nombre"`
+		Descripcion string   `json:"descripcion"`
+		Permisos    []string `json:"permisos"`
+	}
+	roles := make([]role, 0)
+	indices := make(map[int]int)
 	for rows.Next() {
 		var id int
-		var nombre string
-		if err := rows.Scan(&id, &nombre); err != nil {
+		var nombre, descripcion string
+		var permiso sql.NullString
+		if err := rows.Scan(&id, &nombre, &descripcion, &permiso); err != nil {
 			log.Printf("admin: GetRoles scan: %v", err)
 			continue
 		}
-		roles = append(roles, map[string]interface{}{"id": id, "nombre": nombre})
+		index, exists := indices[id]
+		if !exists {
+			index = len(roles)
+			indices[id] = index
+			roles = append(roles, role{ID: id, Nombre: nombre, Descripcion: descripcion, Permisos: make([]string, 0)})
+		}
+		if permiso.Valid {
+			roles[index].Permisos = append(roles[index].Permisos, permiso.String)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		adminDBError(w, "GetRoles rows", err)
 		return
 	}
 	adminJSON(w, http.StatusOK, roles)
+}
+
+func (h *AdminHandler) GetPermisos(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		adminError(w, http.StatusMethodNotAllowed, "Método no permitido")
+		return
+	}
+	rows, err := h.DB.Query(`SELECT codigo, nombre, descripcion FROM permisos ORDER BY codigo`)
+	if err != nil {
+		adminDBError(w, "GetPermisos", err)
+		return
+	}
+	defer rows.Close()
+
+	permisos := make([]map[string]string, 0)
+	for rows.Next() {
+		var codigo, nombre, descripcion string
+		if err := rows.Scan(&codigo, &nombre, &descripcion); err != nil {
+			adminDBError(w, "GetPermisos scan", err)
+			return
+		}
+		permisos = append(permisos, map[string]string{
+			"codigo": codigo, "nombre": nombre, "descripcion": descripcion,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		adminDBError(w, "GetPermisos rows", err)
+		return
+	}
+	adminJSON(w, http.StatusOK, permisos)
+}
+
+func (h *AdminHandler) CrearRol(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		adminError(w, http.StatusMethodNotAllowed, "Método no permitido")
+		return
+	}
+	var req struct {
+		Nombre      string   `json:"nombre"`
+		Descripcion string   `json:"descripcion"`
+		Permisos    []string `json:"permisos"`
+	}
+	if !adminDecode(w, r, &req) {
+		return
+	}
+	req.Nombre = strings.TrimSpace(req.Nombre)
+	req.Descripcion = strings.TrimSpace(req.Descripcion)
+	if req.Nombre == "" || utf8.RuneCountInString(req.Nombre) > 80 || utf8.RuneCountInString(req.Descripcion) > 255 {
+		adminError(w, http.StatusBadRequest, "El nombre del rol es obligatorio (máx. 80 caracteres) y la descripción no puede superar 255")
+		return
+	}
+	if req.Nombre == "Administrador" || req.Nombre == "Usuario Regular" {
+		adminError(w, http.StatusBadRequest, "El nombre del rol está reservado")
+		return
+	}
+
+	tx, err := h.DB.Begin()
+	if err != nil {
+		adminDBError(w, "CrearRol begin", err)
+		return
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`INSERT INTO roles (nombre, descripcion) VALUES (?, ?)`, req.Nombre, req.Descripcion)
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			adminError(w, http.StatusConflict, "Ya existe un rol con ese nombre")
+			return
+		}
+		adminDBError(w, "CrearRol insert", err)
+		return
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		adminDBError(w, "CrearRol id", err)
+		return
+	}
+	if err := replaceRolePermissions(tx, int(id), req.Permisos); err != nil {
+		if errors.Is(err, errInvalidPermission) {
+			adminError(w, http.StatusBadRequest, "La lista contiene permisos inválidos")
+			return
+		}
+		adminDBError(w, "CrearRol permisos", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		adminDBError(w, "CrearRol commit", err)
+		return
+	}
+	adminJSON(w, http.StatusCreated, map[string]interface{}{"mensaje": "Rol creado", "id": id})
+}
+
+func (h *AdminHandler) ActualizarRol(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		adminError(w, http.StatusMethodNotAllowed, "Método no permitido")
+		return
+	}
+	var req struct {
+		ID          int      `json:"id"`
+		Nombre      string   `json:"nombre"`
+		Descripcion string   `json:"descripcion"`
+		Permisos    []string `json:"permisos"`
+	}
+	if !adminDecode(w, r, &req) {
+		return
+	}
+	req.Nombre = strings.TrimSpace(req.Nombre)
+	req.Descripcion = strings.TrimSpace(req.Descripcion)
+	if req.ID <= 0 || req.Nombre == "" || utf8.RuneCountInString(req.Nombre) > 80 || utf8.RuneCountInString(req.Descripcion) > 255 {
+		adminError(w, http.StatusBadRequest, "Rol o datos inválidos")
+		return
+	}
+	tx, err := h.DB.Begin()
+	if err != nil {
+		adminDBError(w, "ActualizarRol begin", err)
+		return
+	}
+	defer tx.Rollback()
+
+	var rolActual string
+	if err := tx.QueryRow(`SELECT nombre FROM roles WHERE id = ?`, req.ID).Scan(&rolActual); err == sql.ErrNoRows {
+		adminError(w, http.StatusNotFound, "Rol no encontrado")
+		return
+	} else if err != nil {
+		adminDBError(w, "ActualizarRol lookup", err)
+		return
+	}
+	if rolActual == "Administrador" || rolActual == "Usuario Regular" {
+		if req.Nombre != rolActual {
+			adminError(w, http.StatusBadRequest, "El nombre del rol está reservado")
+			return
+		}
+	}
+	if rolActual == "Administrador" {
+		var count int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM permisos`).Scan(&count); err != nil {
+			adminDBError(w, "ActualizarRol permisos count", err)
+			return
+		}
+		unique := make(map[string]struct{}, len(req.Permisos))
+		for _, permission := range req.Permisos {
+			unique[permission] = struct{}{}
+		}
+		if len(unique) != count {
+			adminError(w, http.StatusBadRequest, "El rol Administrador debe conservar todos los permisos")
+			return
+		}
+	}
+
+	result, err := tx.Exec(`UPDATE roles SET nombre = ?, descripcion = ? WHERE id = ?`, req.Nombre, req.Descripcion, req.ID)
+	if err != nil {
+		if strings.Contains(strings.ToUpper(err.Error()), "UNIQUE") {
+			adminError(w, http.StatusConflict, "Ya existe un rol con ese nombre")
+			return
+		}
+		adminDBError(w, "ActualizarRol update", err)
+		return
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		adminError(w, http.StatusNotFound, "Rol no encontrado")
+		return
+	}
+	if err := replaceRolePermissions(tx, req.ID, req.Permisos); err != nil {
+		if errors.Is(err, errInvalidPermission) {
+			adminError(w, http.StatusBadRequest, "La lista contiene permisos inválidos")
+			return
+		}
+		adminDBError(w, "ActualizarRol permisos", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		adminDBError(w, "ActualizarRol commit", err)
+		return
+	}
+	adminJSON(w, http.StatusOK, map[string]string{"mensaje": "Rol actualizado"})
+}
+
+func (h *AdminHandler) EliminarRol(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
+		adminError(w, http.StatusMethodNotAllowed, "Método no permitido")
+		return
+	}
+	var req struct {
+		RolID int `json:"rol_id"`
+	}
+	if !adminDecode(w, r, &req) {
+		return
+	}
+	if req.RolID <= 0 {
+		adminError(w, http.StatusBadRequest, "rol_id es obligatorio")
+		return
+	}
+	tx, err := h.DB.Begin()
+	if err != nil {
+		adminDBError(w, "EliminarRol begin", err)
+		return
+	}
+	defer tx.Rollback()
+
+	var nombre string
+	err = tx.QueryRow(`SELECT nombre FROM roles WHERE id = ?`, req.RolID).Scan(&nombre)
+	if err == sql.ErrNoRows {
+		adminError(w, http.StatusNotFound, "Rol no encontrado")
+		return
+	}
+	if err != nil {
+		adminDBError(w, "EliminarRol lookup", err)
+		return
+	}
+	if nombre == "Administrador" || nombre == "Usuario Regular" {
+		adminError(w, http.StatusConflict, "Los roles del sistema no se pueden eliminar")
+		return
+	}
+	var asignados int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM usuario_rol WHERE rol_id = ?`, req.RolID).Scan(&asignados); err != nil {
+		adminDBError(w, "EliminarRol assigned", err)
+		return
+	}
+	if asignados > 0 {
+		adminError(w, http.StatusConflict, "No se puede eliminar un rol asignado a usuarios")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM roles WHERE id = ?`, req.RolID); err != nil {
+		adminDBError(w, "EliminarRol delete", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		adminDBError(w, "EliminarRol commit", err)
+		return
+	}
+	adminJSON(w, http.StatusOK, map[string]string{"mensaje": "Rol eliminado"})
+}
+
+var errInvalidPermission = errors.New("permiso inválido")
+
+func replaceRolePermissions(tx *sql.Tx, roleID int, codes []string) error {
+	permissionIDs := make([]int, 0, len(codes))
+	seen := make(map[string]struct{}, len(codes))
+	for _, code := range codes {
+		code = strings.TrimSpace(code)
+		if _, exists := seen[code]; exists {
+			continue
+		}
+		seen[code] = struct{}{}
+		var permissionID int
+		err := tx.QueryRow(`SELECT id FROM permisos WHERE codigo = ?`, code).Scan(&permissionID)
+		if err == sql.ErrNoRows {
+			return errInvalidPermission
+		}
+		if err != nil {
+			return err
+		}
+		permissionIDs = append(permissionIDs, permissionID)
+	}
+	if _, err := tx.Exec(`DELETE FROM rol_permiso WHERE rol_id = ?`, roleID); err != nil {
+		return err
+	}
+	for _, permissionID := range permissionIDs {
+		if _, err := tx.Exec(`INSERT INTO rol_permiso (rol_id, permiso_id) VALUES (?, ?)`, roleID, permissionID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *AdminHandler) AsignarRol(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +407,29 @@ func (h *AdminHandler) AsignarRol(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.UsuarioID <= 0 || req.RolID <= 0 {
 		adminError(w, http.StatusBadRequest, "UsuarioID y RolID son obligatorios")
+		return
+	}
+	var roleExists int
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM roles WHERE id = ?`, req.RolID).Scan(&roleExists); err != nil {
+		adminDBError(w, "AsignarRol role", err)
+		return
+	}
+	if roleExists == 0 {
+		adminError(w, http.StatusBadRequest, "El rol seleccionado no existe")
+		return
+	}
+	var rolePermissionCount int
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM rol_permiso WHERE rol_id = ?`, req.RolID).Scan(&rolePermissionCount); err != nil {
+		adminDBError(w, "AsignarRol permisos", err)
+		return
+	}
+	canManageRoles, err := h.actorCanManageRoles(r)
+	if err != nil {
+		adminDBError(w, "AsignarRol actor", err)
+		return
+	}
+	if rolePermissionCount > 0 && !canManageRoles {
+		adminError(w, http.StatusForbidden, "Se requiere permiso para administrar roles y permisos")
 		return
 	}
 
@@ -511,6 +828,20 @@ func (h *AdminHandler) CrearUsuario(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusBadRequest, "El rol seleccionado no existe")
 		return
 	}
+	var rolePermissionCount int
+	if err := h.DB.QueryRow(`SELECT COUNT(*) FROM rol_permiso WHERE rol_id = ?`, req.RolID).Scan(&rolePermissionCount); err != nil {
+		adminDBError(w, "CrearUsuario permisos", err)
+		return
+	}
+	canManageRoles, err := h.actorCanManageRoles(r)
+	if err != nil {
+		adminDBError(w, "CrearUsuario actor", err)
+		return
+	}
+	if rolePermissionCount > 0 && !canManageRoles {
+		adminError(w, http.StatusForbidden, "Se requiere permiso para asignar roles con permisos")
+		return
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12) // mismo costo que los hashes existentes
 	if err != nil {
@@ -557,4 +888,20 @@ func (h *AdminHandler) CrearUsuario(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	adminJSON(w, http.StatusCreated, map[string]interface{}{"mensaje": "Usuario creado", "id": id})
+}
+
+func (h *AdminHandler) actorCanManageRoles(r *http.Request) (bool, error) {
+	userID, ok := middlewares.UserIDFromRequest(r)
+	if !ok {
+		return false, nil
+	}
+	var allowed bool
+	err := h.DB.QueryRow(`SELECT EXISTS (
+		SELECT 1
+		FROM usuario_rol ur
+		JOIN rol_permiso rp ON rp.rol_id = ur.rol_id
+		JOIN permisos p ON p.id = rp.permiso_id
+		WHERE ur.usuario_id = ? AND p.codigo = 'roles.gestionar'
+	)`, userID).Scan(&allowed)
+	return allowed, err
 }

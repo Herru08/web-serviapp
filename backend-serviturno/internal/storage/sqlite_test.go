@@ -2,6 +2,8 @@ package storage
 
 import (
 	"database/sql"
+	"os"
+	"path/filepath"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -46,5 +48,51 @@ func TestEnsureRoleDescriptionSupportsLegacySchema(t *testing.T) {
 	}
 	if roleCount != 1 {
 		t.Fatalf("expected seeded regular role, got %d matching roles", roleCount)
+	}
+}
+
+func TestPermissionsMigrationSeedsCatalogAndDefaultRoles(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`
+		CREATE TABLE roles (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE, descripcion TEXT);
+		CREATE TABLE usuarios (id INTEGER PRIMARY KEY);
+		CREATE TABLE usuario_rol (usuario_id INTEGER NOT NULL, rol_id INTEGER NOT NULL, PRIMARY KEY (usuario_id, rol_id));
+		INSERT INTO roles VALUES (1, 'Administrador', 'Control total');
+		INSERT INTO roles VALUES (2, 'Usuario Regular', 'Acceso básico');
+		INSERT INTO usuarios VALUES (1);
+		INSERT INTO usuarios VALUES (2);
+		INSERT INTO usuario_rol VALUES (1, 1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	migration, err := os.ReadFile(filepath.Join("..", "..", "migrations", "005_create_permisos.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(migration)); err != nil {
+		t.Fatalf("apply permissions migration: %v", err)
+	}
+	if _, err := db.Exec(string(migration)); err != nil {
+		t.Fatalf("reapply permissions migration: %v", err)
+	}
+
+	var permissionCount, adminPermissionCount, defaultRoleCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM permisos`).Scan(&permissionCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rol_permiso WHERE rol_id = 1`).Scan(&adminPermissionCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM usuario_rol WHERE usuario_id = 2 AND rol_id = 2`).Scan(&defaultRoleCount); err != nil {
+		t.Fatal(err)
+	}
+	if permissionCount != 9 || adminPermissionCount != permissionCount || defaultRoleCount != 1 {
+		t.Fatalf("migration counts = permissions %d, admin grants %d, default assignments %d", permissionCount, adminPermissionCount, defaultRoleCount)
 	}
 }
